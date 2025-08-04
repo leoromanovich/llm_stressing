@@ -5,7 +5,39 @@ import time
 from dataclasses import dataclass
 from typing import List, Optional, Dict, Any
 
-from locust import HttpUser, task, events, constant
+from locust import HttpUser, task, events, constant, LoadTestShape
+
+# =========================
+#   STAGES: последовательно
+#   duration — в секундах
+# =========================
+STAGES = [
+    {"label": "N=5 | t=32", "duration": 60, "users": 5, "spawn_rate": 2, "overrides": {"max_tokens": 32}},
+    {"label": "N=10 | t=32", "duration": 60, "users": 10, "spawn_rate": 2},
+    {"label": "N=20 | t=32", "duration": 60, "users": 20, "spawn_rate": 4},
+]
+_CURRENT_STAGE_IDX = 0  # обновляется shape'ом
+
+
+def current_stage() -> Dict[str, Any]:
+    return STAGES[_CURRENT_STAGE_IDX]
+
+
+class StagesShape(LoadTestShape):
+    """Последовательные окна нагрузки. Суммарная длительность = сумма duration."""
+
+    stages = STAGES
+
+    def tick(self):
+        global _CURRENT_STAGE_IDX
+        run_time = self.get_run_time()
+        acc = 0
+        for i, s in enumerate(self.stages):
+            acc += s["duration"]
+            if run_time < acc:
+                _CURRENT_STAGE_IDX = i
+                return (s["users"], s["spawn_rate"])
+        return None  # завершение теста после последнего стейджа
 
 
 # ---- CLI options -----------------------------------------------------------
@@ -24,9 +56,7 @@ def _(parser):
         help="Model name to send in the request payload",
     )
     parser.add_argument(
-        "--stream",
-        action="store_true",
-        help="Use stream=true and measure full-stream duration (from first byte until [DONE])",
+        "--stream", action="store_true", help="Use stream=true and measure full-stream duration (until [DONE])"
     )
     parser.add_argument(
         "--max-tokens",
@@ -44,7 +74,7 @@ def _(parser):
         "--prompt-file",
         type=str,
         default=None,
-        help="Path to prompts file: .txt (one prompt per line) or .jsonl with keys like 'prompt','text','query','user'",
+        help="Path to prompts file: .txt (one per line) or .jsonl with 'prompt'/'text'/'query'/'user'",
     )
     parser.add_argument(
         "--timeout", type=float, default=float(os.getenv("TIMEOUT", 120.0)), help="Request timeout in seconds"
@@ -151,9 +181,7 @@ def to_chat_messages(prompt: str) -> List[Dict[str, str]]:
 
 
 def sse_events(response):
-    """Yield parsed JSON objects from an SSE stream of OpenAI chat completions.
-    Stops on [DONE].
-    """
+    """Yield parsed JSON objects from an SSE stream of OpenAI chat completions. Stops on [DONE]."""
     for raw in response.iter_lines(decode_unicode=True):
         if not raw:
             continue
@@ -166,14 +194,12 @@ def sse_events(response):
             try:
                 yield json.loads(data)
             except json.JSONDecodeError:
-                # Best-effort: skip malformed lines
                 continue
 
 
 # ---- Locust user -----------------------------------------------------------
 class LLMUser(HttpUser):
-    # Set to 0 for maximum throughput; tune if you want user think-time
-    wait_time = constant(0)
+    wait_time = constant(0)  # максимум throughput
 
     def on_start(self):
         po = self.environment.parsed_options
@@ -193,8 +219,8 @@ class LLMUser(HttpUser):
         self.prompts = load_prompts(self.opts.prompt_file)
         self.headers = build_headers(self.opts.auth)
 
-        # A stable metric name helps when comparing runs
-        self.metric_name = self.opts.name or (
+        # базовое имя; к нему добавим label стейджа
+        self.metric_base = self.opts.name or (
             f"{self.opts.endpoint} - {self.opts.input_type} - "
             f"{'stream' if self.opts.stream else 'nonstream'} - {self.opts.model}"
         )
@@ -202,6 +228,10 @@ class LLMUser(HttpUser):
     @task
     def generate(self):
         prompt = random.choice(self.prompts)
+        stage = current_stage()
+        metric_name = f"[{stage['label']}] {self.metric_base}"
+
+        # базовый payload
         if self.opts.input_type == "chat":
             payload: Dict[str, Any] = {
                 "model": self.opts.model,
@@ -209,41 +239,53 @@ class LLMUser(HttpUser):
                 "max_tokens": self.opts.max_tokens,
                 "temperature": self.opts.temperature,
             }
-            if self.opts.seed is not None:
-                payload["seed"] = self.opts.seed
-            if self.opts.stream:
-                payload["stream"] = True
-                self._post_chat_stream(payload)
-            else:
-                self._post_json(payload)
-        else:  # completion (legacy /v1/completions)
+        else:
             payload = {
                 "model": self.opts.model,
                 "prompt": prompt,
                 "max_tokens": self.opts.max_tokens,
                 "temperature": self.opts.temperature,
             }
-            if self.opts.seed is not None:
-                payload["seed"] = self.opts.seed
-            if self.opts.stream:
-                payload["stream"] = True
-                self._post_stream_completions(payload)
-            else:
-                self._post_json(payload)
+        if self.opts.seed is not None:
+            payload["seed"] = self.opts.seed
 
-    # --- Non-stream: let Locust measure full response time -----------------
-    def _post_json(self, payload: Dict[str, Any]):
-        # For non-streaming, Locust's HttpSession measures until body is fully read.
+        # overrides стейджа
+        ov = stage.get("overrides", {})
+        if "model" in ov:
+            payload["model"] = ov["model"]
+        if "max_tokens" in ov:
+            payload["max_tokens"] = ov["max_tokens"]
+        if "temperature" in ov:
+            payload["temperature"] = ov["temperature"]
+        streaming = self.opts.stream
+        if "stream" in ov:
+            streaming = bool(ov["stream"])
+
+        # отправка
+        if self.opts.input_type == "chat":
+            if streaming:
+                payload["stream"] = True
+                self._post_chat_stream(payload, metric_name)
+            else:
+                self._post_json(payload, metric_name)
+        else:
+            if streaming:
+                payload["stream"] = True
+                self._post_stream_completions(payload, metric_name)
+            else:
+                self._post_json(payload, metric_name)
+
+    # --- Non-stream: Locust сам меряет до полной выдачи тела ---------------
+    def _post_json(self, payload: Dict[str, Any], metric_name: str):
         with self.client.post(
             self.opts.endpoint,
             headers=self.headers,
             json=payload,
             timeout=self.opts.timeout,
-            name=self.metric_name,
+            name=metric_name,
             catch_response=True,
         ) as resp:
             if resp.status_code != 200:
-                # Surface a concise failure reason
                 try:
                     err = resp.json()
                     msg = err.get("error", {}).get("message") or str(err)[:300]
@@ -251,7 +293,6 @@ class LLMUser(HttpUser):
                     msg = resp.text[:300]
                 resp.failure(f"HTTP {resp.status_code}: {msg}")
             else:
-                # Optionally sanity-check schema
                 try:
                     _ = resp.json()
                 except Exception:
@@ -259,78 +300,61 @@ class LLMUser(HttpUser):
                     return
                 resp.success()
 
-    # --- Streaming for Chat Completions (manual timing of the full stream) --
-    def _post_chat_stream(self, payload: Dict[str, Any]):
-        url = self.client.base_url + self.opts.endpoint.lstrip("/")
-        start = time.perf_counter()
-        exc = None
-        resp = None
-        response_len = 0
-        try:
-            resp = self.client.session.post(
-                url,
-                headers=self.headers,
-                data=json.dumps(payload),
-                stream=True,
-                timeout=self.opts.timeout,
-            )
-            status = resp.status_code
-            if status != 200:
-                # Read a bit of body for diagnostics
+    # --- Streaming for Chat Completions: TTFT + полный стрим ----------------
+    def _post_chat_stream(self, payload: Dict[str, Any], metric_name: str):
+        t0 = time.perf_counter()
+        ttft_ms = None
+        with self.client.post(
+            self.opts.endpoint,
+            headers=self.headers,
+            data=json.dumps(payload),
+            stream=True,
+            timeout=self.opts.timeout,
+            name=metric_name,  # «полный стрим» попадёт в эту метрику (тип=POST)
+            catch_response=True,
+        ) as resp:
+            if resp.status_code != 200:
                 body = resp.text[:500]
-                exc = Exception(f"HTTP {status}: {body}")
-            else:
-                full = []
-                for ev in sse_events(resp):
-                    if not ev:
-                        continue
-                    delta = ev.get("choices", [{}])[0].get("delta", {})
-                    piece = delta.get("content")
-                    if piece:
-                        full.append(piece)
-                        response_len += len(piece)
-        except Exception as e:
-            exc = e
-        finally:
-            total_ms = (time.perf_counter() - start) * 1000.0
-            # Manually fire a Locust event so response_time reflects full-stream duration
-            events.request.fire(
-                request_type="SSE",
-                name=self.metric_name,
-                response_time=total_ms,
-                response_length=response_len,
-                exception=exc,
-                context={"user": self},
-                url=url,
-                response=None,
-            )
+                resp.failure(f"HTTP {resp.status_code}: {body}")
+                return
             try:
-                if resp is not None:
-                    resp.close()
-            except Exception:
-                pass
+                for ev in sse_events(resp):
+                    if ttft_ms is None:
+                        ttft_ms = (time.perf_counter() - t0) * 1000.0
+                        # отдельная метрика TTFT
+                        events.request.fire(
+                            request_type="TTFT",
+                            name=metric_name,
+                            response_time=ttft_ms,
+                            response_length=0,
+                            exception=None,
+                            context={"user": self},
+                            url=self.client.base_url + self.opts.endpoint.lstrip("/"),
+                            response=None,
+                        )
+                    # можно суммировать длину, если нужно
+                resp.success()
+            except Exception as e:
+                resp.failure(str(e))
 
-    # --- Streaming for legacy Completions (if you use /v1/completions) -----
-    def _post_stream_completions(self, payload: Dict[str, Any]):
-        url = self.client.base_url + self.opts.endpoint.lstrip("/")
-        start = time.perf_counter()
-        exc = None
-        resp = None
-        response_len = 0
-        try:
-            resp = self.client.session.post(
-                url,
-                headers=self.headers,
-                data=json.dumps(payload),
-                stream=True,
-                timeout=self.opts.timeout,
-            )
-            status = resp.status_code
-            if status != 200:
+    # --- Streaming для legacy /v1/completions --------------------------------
+    def _post_stream_completions(self, payload: Dict[str, Any], metric_name: str):
+        t0 = time.perf_counter()
+        ttft_ms = None
+        with self.client.post(
+            self.opts.endpoint,
+            headers=self.headers,
+            data=json.dumps(payload),
+            stream=True,
+            timeout=self.opts.timeout,
+            name=metric_name,
+            catch_response=True,
+        ) as resp:
+            if resp.status_code != 200:
                 body = resp.text[:500]
-                exc = Exception(f"HTTP {status}: {body}")
-            else:
-                # For legacy completions, stream chunks contain {choices: [{text: "..."}]} under data:
+                resp.failure(f"HTTP {resp.status_code}: {body}")
+                return
+            try:
                 for raw in resp.iter_lines(decode_unicode=True):
                     if not raw:
                         continue
@@ -342,25 +366,18 @@ class LLMUser(HttpUser):
                             ev = json.loads(data)
                         except json.JSONDecodeError:
                             continue
-                        text_piece = ev.get("choices", [{}])[0].get("text", "")
-                        if text_piece:
-                            response_len += len(text_piece)
-        except Exception as e:
-            exc = e
-        finally:
-            total_ms = (time.perf_counter() - start) * 1000.0
-            events.request.fire(
-                request_type="SSE",
-                name=self.metric_name,
-                response_time=total_ms,
-                response_length=response_len,
-                exception=exc,
-                context={"user": self},
-                url=url,
-                response=None,
-            )
-            try:
-                if resp is not None:
-                    resp.close()
-            except Exception:
-                pass
+                        if ttft_ms is None:
+                            ttft_ms = (time.perf_counter() - t0) * 1000.0
+                            events.request.fire(
+                                request_type="TTFT",
+                                name=metric_name,
+                                response_time=ttft_ms,
+                                response_length=0,
+                                exception=None,
+                                context={"user": self},
+                                url=self.client.base_url + self.opts.endpoint.lstrip("/"),
+                                response=None,
+                            )
+                resp.success()
+            except Exception as e:
+                resp.failure(str(e))
